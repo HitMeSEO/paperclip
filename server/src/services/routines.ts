@@ -1528,6 +1528,102 @@ export function routineService(
     );
   }
 
+  async function listStaleOpenExecutionIssueIds(
+    routine: typeof routines.$inferSelect,
+    executor: Db,
+    dispatchFingerprint: string | null,
+    origin: { kind: string; id: string | null },
+  ): Promise<string[]> {
+    const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
+    const originKind = origin.kind;
+    const originId = origin.id;
+    if (originId === null) return [];
+    const executionBoundLiveIds = await executor
+      .select({ id: issues.id })
+      .from(issues)
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          eq(heartbeatRuns.id, issues.executionRunId),
+          inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
+        ),
+      )
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, originKind),
+          eq(issues.originId, originId),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          visibleIssueCondition(),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+        ),
+      );
+    const snapshotLiveIds = await executor
+      .select({ id: issues.id })
+      .from(issues)
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          eq(heartbeatRuns.companyId, issues.companyId),
+          inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issues.id} as text)`,
+        ),
+      )
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, originKind),
+          eq(issues.originId, originId),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          visibleIssueCondition(),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+        ),
+      );
+    const liveIds = new Set<string>();
+    for (const row of executionBoundLiveIds) liveIds.add(row.id);
+    for (const row of snapshotLiveIds) liveIds.add(row.id);
+    const openRows = await executor
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, originKind),
+          eq(issues.originId, originId),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          visibleIssueCondition(),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+        ),
+      );
+    return openRows.map((row) => row.id).filter((id) => !liveIds.has(id));
+  }
+
+  async function cancelStaleOpenExecutionIssues(
+    routine: typeof routines.$inferSelect,
+    executor: Db,
+    dispatchFingerprint: string | null,
+    origin: { kind: string; id: string | null },
+    newRunId: string,
+  ): Promise<string[]> {
+    const staleIds = await listStaleOpenExecutionIssueIds(routine, executor, dispatchFingerprint, origin);
+    for (const staleId of staleIds) {
+      await issueSvc.update(
+        staleId,
+        {
+          status: "cancelled",
+          executionRunId: null,
+          companyGuard: routine.companyId,
+        },
+        executor,
+      );
+      logger.info(
+        { routineId: routine.id, staleIssueId: staleId, newRunId },
+        "cancelled stale routine_execution issue",
+      );
+    }
+    return staleIds;
+  }
+
   async function findLiveExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
@@ -1857,6 +1953,20 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
+        // Cancel any open prior routine_execution issues that have no live heartbeat run.
+        // Those orphans are abandoned work that would otherwise accumulate across every
+        // schedule fire and fail the one-live-run invariant. The actively executing run
+        // (if any) stays untouched so coalesce_if_active / skip_if_active still bind to it.
+        if (input.routine.concurrencyPolicy !== "always_enqueue") {
+          await cancelStaleOpenExecutionIssues(
+            input.routine,
+            txDb,
+            dispatchFingerprint,
+            { kind: issueOriginKind, id: issueOriginId },
+            createdRun.id,
+          );
+        }
+
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,

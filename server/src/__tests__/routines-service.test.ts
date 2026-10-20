@@ -1484,6 +1484,79 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(routineIssues[0]?.id).toBe(previousIssue.id);
   });
 
+  it("cancels an orphaned open routine_execution issue and creates a fresh one on the next fire", async () => {
+    // Regression guard for HMS-1311: a stale open routine_execution issue with no
+    // live heartbeat run must be cancelled when the schedule fires again, so only
+    // one live sweep issue ever exists per idempotent recurring task class.
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const staleRunId = randomUUID();
+    const staleHeartbeatRunId = randomUUID();
+    const staleIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "in_progress",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: staleRunId,
+    });
+
+    await db.insert(routineRuns).values({
+      id: staleRunId,
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "schedule",
+      status: "issue_created",
+      triggeredAt: new Date("2026-03-20T06:00:00.000Z"),
+      linkedIssueId: staleIssue.id,
+    });
+
+    // Heartbeat run that touched this issue has already completed; the issue is
+    // stuck open with no live heartbeat run. This is the exact orphan shape that
+    // the mailbox-sweep routine piled up before HMS-1311.
+    await db.insert(heartbeatRuns).values({
+      id: staleHeartbeatRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "completed",
+      contextSnapshot: { issueId: staleIssue.id },
+      startedAt: new Date("2026-03-20T06:01:00.000Z"),
+      finishedAt: new Date("2026-03-20T06:05:00.000Z"),
+    });
+
+    await db
+      .update(issues)
+      .set({
+        executionRunId: staleHeartbeatRunId,
+        executionLockedAt: new Date("2026-03-20T06:01:00.000Z"),
+      })
+      .where(eq(issues.id, staleIssue.id));
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(staleIssue.id);
+
+    const routineIssues = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+
+    const open = routineIssues.filter(
+      (row) => row.status !== "cancelled" && row.status !== "done",
+    );
+    expect(open).toHaveLength(1);
+    expect(open[0]?.id).toBe(run.linkedIssueId);
+
+    const refreshedStale = routineIssues.find((row) => row.id === staleIssue.id);
+    expect(refreshedStale?.status).toBe("cancelled");
+  });
+
   it("preserves the archive and Mine membership when a manual run coalesces", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
     const userId = randomUUID();
